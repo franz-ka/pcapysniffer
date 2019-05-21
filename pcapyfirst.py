@@ -6,6 +6,7 @@ import socket
 import struct
 import datetime, time
 import sys
+from netutils import *
 
 f=open(sys.path[0]+'/pcapytorguards.txt','r')
 torguards=f.read().split('\n')
@@ -26,21 +27,7 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
-
-PROTS={6:'TCP',17:'UDP',1:'ICMP'}
-
-#pcapy.findalldevs()
-#c = pcapy.open_live('lo' , 65536 , 1 , 0)
-try: c = pcapy.open_live('wlp3s0' , 65536 , 1 , 0)
-except pcapy.PcapError as e:
-	if "don't have permission" in str(e): printerr('Requiere sudo')
-	else: throw(e)
-	sys.exit(1)
-
-def eth_addr(a):
-	return "%.2x:%.2x:%.2x:%.2x:%.2x:%.2x" % (a[0] , a[1] , a[2], a[3], a[4] , a[5])
-
-_locaddrs = ['127.0.0.1', '192.168.0.92', 'e8:de:27:39:ce:a6']
+    
 _loccol = bcolors.OKGREEN
 _remcol = bcolors.YELLW
 def print_ipaddrs(scraddr, dstaddr):	
@@ -73,25 +60,71 @@ def print_addrs(scraddr, srcport, dstaddr, dstport):
 	return '{} {} {}'.format(locaddr+bcolors.ENDC, condir, remaddr+bcolors.ENDC)	
 def print_ethaddrs(srcaddr, dstaddr):
 	return print_ipaddrs(srcaddr, dstaddr)
-		
-def dump_decodes(barr):
-	return 'hex={} || utf8={} || ascii={}'.format(barr.hex(), barr.decode('utf8','ignore'), barr.decode('ascii','ignore'))
-	
-def int_bin_repr(i, zfil=8):
-	return bin(i)[2:].zfill(zfil)
-def bytes_bin_repr(byts, zfil=8):
-	return int_bin_repr(int.from_bytes(byts, byteorder=sys.byteorder), zfil)
 
+class _debug:
+	#ether=True
+	ip=False
+	ipopts=False
+	tcp=True
+	tcpopts=True
+	udp=False	
+	torskip=True
+	torshowskip=False
+
+#pcapy.findalldevs()
+#c = pcapy.open_live('lo' , 65536 , 1 , 0)
+try: c = pcapy.open_live('wlp3s0' , 65536 , 1 , 0)
+except pcapy.PcapError as e:
+	if "don't have permission" in str(e): printerr('Requiere sudo')
+	else: throw(e)
+	sys.exit(1)
+
+
+_locaddrs = ['127.0.0.1', '192.168.0.92', 'e8:de:27:39:ce:a6']
+PROTS={6:'TCP',17:'UDP',1:'ICMP'}
 #(intX=Xbytes)bB=int1, hH=int2, lLiI=int4, qQ=int8, sp=string, !=netorder(big-end)
 upackbytes = {1:'B',2:'H',4:'L'}
-		
+
+_tcpconerasesecs = 5
+class Tcpcon:
+	def __init__(self,addr):
+		self.lastt=datetime.datetime.now()
+		self.addr=addr
+		self.msgsin=0
+		self.msgsout=0
+class TcpconMgr:
+	def __init__(self):
+		self.conns={}
+	def add(self,addr):
+		self.conns[addr]=Tcpcon(addr)
+		return self.conns[addr]
+	def get(self,addr):
+		return self.conns.get(addr)
+	def update(self,addr):
+		if addr in self.conns:
+			self.conns[addr].lastt=datetime.datetime.now()
+		else:
+			self.add(addr)
+		return self.conns[addr]
+	def clean(self):
+		dtnow=datetime.datetime.now()
+		delconns=[]
+		for addr,conn in self.conns.items():
+			if (conn.lastt-dtnow).total_seconds() > _tcpconerasesecs:
+				delconns.append(addr)
+		for addr in delconns:
+			del self.conns[addr]
+		return len(delconns)
+
+tcpconmgr=TcpconMgr()
+
 def handle_packet(pkh, data):
 	#getts getcaplen getlen
 	ptimes=pkh.getts()
 	pdate=time.localtime(ptimes[0])
 	plen=pkh.getlen()
 	datai=0
-	#print(time.strftime('%H:%M:%S', pdate)+'.'+str(ptimes[1])[:3], str(plen)+'B')
+	print(time.strftime('%H:%M:%S', pdate)+'.'+str(ptimes[1])[:3], str(plen)+'B')
 
 	eth_length = 14
 	eth_header = data[:eth_length]
@@ -121,19 +154,48 @@ def handle_packet(pkh, data):
 		ip_minhlen = 5*4
 		ip_header = data[datai:datai+ip_minhlen]
 		datai += ip_minhlen
+		
 		#0=V+IHL,1=DSCP+ECN,2=len,3=ID,4=Flags+FragOff,5=TTL,6=Prot,7=HeadCheck
 		iph = struct.unpack('!BBHHHBBH4s4s' , ip_header)
 
 		version_hl = iph[0]
 		version = version_hl >> 4
 		iphlen = version_hl & 0xF
-		#iph_length = iphlen * 4 #32 bit words=4 bytes
-		#opts
+		#1 iphlen = 32 bit word = 4 bytes
+		ttl = iph[5]
+		protocol = iph[6]
+		s_addr = socket.inet_ntoa(iph[8]);
+		d_addr = socket.inet_ntoa(iph[9]);
+		if str(s_addr) in _locaddrs:
+			loc_addr = s_addr
+			rem_addr = d_addr
+		elif str(d_addr) in _locaddrs:
+			loc_addr = d_addr
+			rem_addr = s_addr
+		else:
+			loc_addr = rem_addr = None
+		
+		if _debug.torskip and str(s_addr) in torguards or str(d_addr) in torguards:
+			if _debug.torshowskip: print('TorGuard', str(s_addr), '->', str(d_addr), str(plen)+'bytes')
+			return
+
+		if _debug.ip:
+			print(
+				'IP V:' + str(version),
+				'HLen:' + str(iphlen),
+				'TTL:' + str(ttl),
+				'Prot:' + str(protocol) + ' ' + PROTS.get(protocol,'-'),
+				'SrcIP: ' + str(s_addr),
+				'DstIP: ' + str(d_addr))
+			#print(str(s_addr), '>', str(d_addr), PROTS.get(protocol, str(protocol)), str(iph_length))
+		
+		#IP OPTS
 		if iphlen>5:
 			#ip Option Format - http://www.tcpipguide.com/free/t_IPDatagramOptionsandOptionFormat.htm
 			#IP Option Numbers - https://www.iana.org/assignments/ip-parameters/ip-parameters.xhtml
-			firstopth = data[datai:datai+2]
-			datai+=datai+2		
+			ipopthlen=2#bytes
+			firstopth = data[datai:datai+ipopthlen]
+			datai+=datai+ipopthlen		
 				
 			firstopt = struct.unpack('!BB' , firstopth)
 						
@@ -149,76 +211,125 @@ def handle_packet(pkh, data):
 			#ip_optslen=(iphlen-5)*4
 			#print('ip_opts',(iphlen-5),data[datai:datai+ip_optslen])
 			
-			print(
-				'fcopy={}'.format(foptcop),
-				'clas={}({})'.format(ipoptclas.get(foptcla), foptcla),
-				'opn={}({})'.format(ipoptnums.get(foptnum), foptnum),
-				'oplen={}'.format(foplen),
-				'opdata={}'.format(bytes_bin_repr(fopdata)))
+			if _debug.ipopts:
+				print(
+					'IPOPT fcopy={}'.format(foptcop),
+					'clas={}({})'.format(ipoptclas.get(foptcla), foptcla),
+					'opn={}({})'.format(ipoptnums.get(foptnum), foptnum),
+					'oplen={}'.format(foplen),
+					'opdata={}'.format(bytes_bin_repr(fopdata)))
+		#end ip opts		
 
-		ttl = iph[5]
-		protocol = iph[6]
-		s_addr = socket.inet_ntoa(iph[8]);
-		d_addr = socket.inet_ntoa(iph[9]);
-		if str(s_addr) in torguards or str(d_addr) in torguards:
-			#print('TorGuard')
-			return
-
-		#print('V:' + str(version), 'TTL:' + str(ttl), 'Prot:' + str(protocol), 'SrcIP: ' + str(s_addr), 'DstIP: ' + str(d_addr))
-		#print(str(s_addr), '>', str(d_addr), PROTS.get(protocol, str(protocol)), str(iph_length))
-
-		#protocol num https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+		#protocol num - https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
 		#TCP
 		if protocol == 6:
-			tcp_minhlen = 5*4 #5 * 32bit words (4bytes)
+			tcp_minhlen = 5*4 #5 32bit words = 5*4bytes
 			tcp_header = data[datai:datai+tcp_minhlen]
 			datai += tcp_minhlen
 
 			#now unpack them :)
 			#TCP Header Fields - http://www.omnisecu.com/tcpip/tcp-header.php
+			''' TCP
+			 |0001020304050607|0809101112131415|1617181920212223|2425262728293031|
+			1|            Source Port          |           Dest Port             |          
+			2|                            Sequen Number                          |
+			3|                             Acknow Num                            |
+			4|Head Len |     Reserv     |UAPRSF|       Windw Size bytes          |
+			5|             Checksum            |         Urg Pointer             |
+			[|Opt type|Opt len| 	  Opt data..           ..|..    paddding     |]
+			'''
 			#(intX=Bytes)bB=int1, hH=int2, lLiI=int4, qQ=int8, sp=string, !=netorder(big-end)
 			tcpstruct = {'srcport':2, 'dstport':2, 'seqn':4, 'ackn':4,
-			'hl_res':1, 'flags':1, 'rcvwin':2, 'chck':2, 'urgp':2}
-			#'!HHLLBBHHH'
+			'hl_res_flg':2, 'rcvwin':2, 'chck':2, 'urgp':2}
+			tcpflag=['fin','syn','rst','psh','ack','urg']
 			tcpfmt = '!'+''.join([upackbytes[b] for k,b in tcpstruct.items()])
+			#'!HHLLBBHHH'
 			tcph = struct.unpack(tcpfmt, tcp_header)
 			source_port = tcph[0]
 			dest_port = tcph[1]
 			sequence = tcph[2]
 			acknowledgement = tcph[3]
-			hl_res = tcph[4]
-			tcph_length = hl_res >> 4
-			res=hl_res&(2**7-1)
-			flags=tcph[5]
-			print(
-				*[k+'='+str(tcph[i]) for i,k in enumerate(tcpstruct) if k not in ['srcport','dstport','hl_res','flags']],
-				'hlenw=' + str(tcph_length),
-				'res='+int_bin_repr(res, 6))
+			hl_res_flg = tcph[4]
+			
+			tcph_length = hl_res_flg >> 4+8
+			res = (hl_res_flg >> 6) & 2**6-1
+			flags = hl_res_flg & 2**6-1
+			print(int_bin_repr(tcph_length), tcph_length, int_bin_repr(hl_res_flg,16))
+			if _debug.tcp:
+				print(
+					'TCP',
+					*[k+'='+str(tcph[i]) for i,k in enumerate(tcpstruct) if k not in ['hl_res_flg']],
+					'hlen=' + str(tcph_length),
+					'res='+int_bin_repr(res, 6))					
+				print('TPCFGS', *[f+'='+('0' if flags&2**i == 0 else '1' ) for i,f in enumerate(tcpflag)])
 			#print(*[k+'='+str(tcph[i]) for i,k in enumerate(tcpstruct)], 'hlenw=' + str(tcph_length))
 			#print(*[str(i)+'='+str(flags&2**i) for i in range(6)])
-			tcpflag=['fin','syn','rst','psh','ack','urg']
-			print(*[f+'='+('0' if flags&2**i == 0 else '1' ) for i,f in enumerate(tcpflag)])
 			fgfin=flags&2**0
 			fgsyn=flags&2**1
 			fgrst=flags&2**2
 			fgpsh=flags&2**3
 			fgack=flags&2**4
 			fgurg=flags&2**5
-			#opts
+			
+			#tcp opts
 			if tcph_length>5:
-				tcp_optslen=(tcph_length-5)*4
-				#print('tcp_opts',tcph_length-5,bin(int.from_bytes(data[datai:datai+tcp_optslen],byteorder='big')))
-				datai+=tcp_optslen
+				#TCP Options - https://www.freesoft.org/CIE/Course/Section4/8.htm				
+				#TCP Option Kind Numbers - https://www.iana.org/assignments/tcp-parameters/tcp-parameters.xhtml
+				tcpoptstotlen=tcph_length*4-tcp_minhlen
+				tcpopthlen=1#bytes
+				tcpoptkinds={0:'EOL',1:'NOOP',2:'MAXSS',8:'TIMESTP'}
 				
-			'''if str(s_addr) in ['127.0.0.1', '192.168.0.92']:
-				locaddr=str(s_addr)+':'+str(source_port)
-				condir='->'
-				remaddr=str(d_addr)+':'+str(dest_port)
-			elif str(d_addr) in ['127.0.0.1', '192.168.0.92']:
-				locaddr=str(d_addr)+':'+str(dest_port)
-				condir='<-'
-				remaddr=bcolors.YELLW+str(s_addr)+':'+str(source_port)'''
+				tcpoptsdata = data[datai:datai+tcpoptstotlen]
+				datai+=tcpoptstotlen		
+				#print(tcpoptsdata[0],tcpoptsdata[1],tcpoptsdata[2],bytes_bin_repr(tcpoptsdata, tcpoptstotlen))		
 				
+				tcpopti=0
+				while tcpopti < tcpoptstotlen:
+					tcpoptkind = tcpoptsdata[tcpopti]
+					tcpopti+=1
+												
+					if tcpoptkind==0:
+						if _debug.tcpopts:
+							print('TCPOPT', tcpoptkinds.get(tcpoptkind,''))
+						break
+					elif tcpoptkind==1:
+						if _debug.tcpopts:
+							print('TCPOPT', tcpoptkinds.get(tcpoptkind,''))
+						continue
+					elif tcpoptkind==2:
+						tcpoptklen = tcpoptsdata[tcpopti]
+						tcpopti+=1
+						if tcpoptklen!=4:
+							printerr('tcp opt mss len != 4, es =' + str(tcpoptklen))
+							break
+						tcpmss=struct.unpack('!H' , tcpoptsdata[tcpopti:tcpopti+2])[0]
+						tcpopti+=2
+						if _debug.tcpopts:
+							print('TCPOPT', tcpoptkinds.get(tcpoptkind,''), 'mss=', tcpmss)
+					elif tcpoptkind==8:
+						#http://www.networksorcery.com/enp/protocol/tcp/option008.htm
+						tcpoptklen = tcpoptsdata[tcpopti]
+						tcpopti+=1
+						if tcpoptklen!=10:
+							printerr('tcp opt timestp len != 10, es =' + str(tcpoptklen))
+							break
+						tcptstp=struct.unpack('!LL' , tcpoptsdata[tcpopti:tcpopti+4*2])
+						tcpopti+=4*2
+						if _debug.tcpopts:
+							print(
+								'TCPOPT', tcpoptkinds.get(tcpoptkind,''), 
+								'tsval=' + str(tcptstp[0]), 
+								'tsecr=' + str(tcptstp[1]))
+					else:
+						printerr('tcp opt desconocida ' + str(tcpoptkind))
+						break
+			#end tcp opts
+			if rem_addr:
+				remcon = tcpconmgr.update(rem_addr)
+				if rem_addr == d_addr: remcon.msgsout+=1
+				else: remcon.msgsin+=1
+				print(remcon.msgsin,remcon.msgsout)
+		
 			print(
 				PROTS.get(protocol, str(protocol))[0], 
 				print_addrs(s_addr, source_port, d_addr, dest_port), 
@@ -331,4 +442,5 @@ r = c.dispatch(5, handle_packet)
 while 1:
 	time.sleep(0.5)
 	r = c.dispatch(10, handle_packet)
+	tcpconmgr.clean()
 	#print(r)
