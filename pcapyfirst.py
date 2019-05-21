@@ -306,8 +306,13 @@ def handle_packet(pkh, data):
 						tcpopti+=2
 						if _debug.tcpopts:
 							print('TCPOPT', tcpoptkinds.get(tcpoptkind,''), 'mss=', tcpmss)
+					elif tcpoptkind==4:
+						#https://tools.ietf.org/html/rfc2018
+						printerr('TCPOPT must implement SACK Permitted')
+						break
 					elif tcpoptkind==8:
 						#http://www.networksorcery.com/enp/protocol/tcp/option008.htm
+						#https://cloudshark.io/articles/tcp-timestamp-option/
 						tcpoptklen = tcpoptsdata[tcpopti]
 						tcpopti+=1
 						if tcpoptklen!=10:
@@ -324,6 +329,15 @@ def handle_packet(pkh, data):
 						printerr('tcp opt desconocida ' + str(tcpoptkind))
 						break
 			#end tcp opts
+			
+			#tcp data
+			if datai < plen:
+				#http://blog.fourthbit.com/2014/12/23/traffic-analysis-of-an-ssl-slash-tls-session/
+				sslrectyps = {20:'CHCIPHR', 21:'ALERT', 22:'HNDSHK', 23:'APPDATA'}
+				if data[datai] in sslrectyps and data[datai+1] == 3:
+					ssltyp=data[datai]
+					print('ssl', sslrectyps.get(ssltyp), data[datai+1], data[datai+2])
+			
 			if rem_addr:
 				remcon = tcpconmgr.update(rem_addr)
 				if rem_addr == d_addr: remcon.msgsout+=1
