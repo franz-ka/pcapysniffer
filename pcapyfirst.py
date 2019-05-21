@@ -14,8 +14,8 @@ f.close()
 import logging
 #logging.basicConfig(level=logging.DEBUG, format='%(levelname)s - %(message)s')
 logging.basicConfig(level=logging.DEBUG, format='%(message)s')
-logging.debug('Start of program')
 def print(*args): logging.debug(' '.join([str(arg) for arg in args]))
+def printerr(err): print(bcolors.FAIL+str(err)+bcolors.ENDC)
 
 class bcolors:
     HEADER = '\033[95m'
@@ -30,8 +30,12 @@ class bcolors:
 PROTS={6:'TCP',17:'UDP',1:'ICMP'}
 
 #pcapy.findalldevs()
-c = pcapy.open_live('wlp3s0' , 65536 , 1 , 0)
 #c = pcapy.open_live('lo' , 65536 , 1 , 0)
+try: c = pcapy.open_live('wlp3s0' , 65536 , 1 , 0)
+except pcapy.PcapError as e:
+	if "don't have permission" in str(e): printerr('Requiere sudo')
+	else: throw(e)
+	sys.exit(1)
 
 def eth_addr(a):
 	return "%.2x:%.2x:%.2x:%.2x:%.2x:%.2x" % (a[0] , a[1] , a[2], a[3], a[4] , a[5])
@@ -73,8 +77,12 @@ def print_ethaddrs(srcaddr, dstaddr):
 def dump_decodes(barr):
 	return 'hex={} || utf8={} || ascii={}'.format(barr.hex(), barr.decode('utf8','ignore'), barr.decode('ascii','ignore'))
 	
-#(intX=Bytes)bB=int1, hH=int2, lLiI=int4, qQ=int8, sp=string, !=netorder(big-end)
-#Hsport,Hdport,Lseqn,Lackn,BBhlen-res-flags,Hwsize,Hchck,Hurget..Lopts
+def int_bin_repr(i, zfil=8):
+	return bin(i)[2:].zfill(zfil)
+def bytes_bin_repr(byts, zfil=8):
+	return int_bin_repr(int.from_bytes(byts, byteorder=sys.byteorder), zfil)
+
+#(intX=Xbytes)bB=int1, hH=int2, lLiI=int4, qQ=int8, sp=string, !=netorder(big-end)
 upackbytes = {1:'B',2:'H',4:'L'}
 		
 def handle_packet(pkh, data):
@@ -89,7 +97,7 @@ def handle_packet(pkh, data):
 	eth_header = data[:eth_length]
 	datai += eth_length
 
-	#(intX=Bytes)bB=int1, hH=int2, lLiI=int4, qQ=int8, sp=string, !=netorder(big-end)
+	#(intX=Xbytes)bB=int1, hH=int2, lLiI=int4, qQ=int8, sp=string, !=netorder(big-end)
 	eth = struct.unpack('!6s6sH' , eth_header)
 	eth_type = eth[2]
 	#eth_protocol = socket.ntohs(eth[2])
@@ -101,6 +109,15 @@ def handle_packet(pkh, data):
 	#if eth_protocol == 8:
 	if eth_type == 2048:
 		#https://en.wikipedia.org/wiki/IPv4#Header
+		''' IPv4
+		 |0001020304050607|0809101112131415|1617181920212223|2425262728293031|
+		1|Version | IHL   | DiffServ   |ECN|     Tot len bytes (head+data)   |          
+		2|              Frag ID            |Flags |   Frag Offset            |
+		3|     TTL        |    Protocol    |         Header chksum           |
+		4|                             Source IP                             |
+		5|                             Destin IP                             |
+		[|Opt type|Opt len| 	  Opt data..           ..|..    paddding     |]
+		'''
 		ip_minhlen = 5*4
 		ip_header = data[datai:datai+ip_minhlen]
 		datai += ip_minhlen
@@ -113,9 +130,31 @@ def handle_packet(pkh, data):
 		#iph_length = iphlen * 4 #32 bit words=4 bytes
 		#opts
 		if iphlen>5:
-			ip_optslen=(iphlen-5)*4
-			print('ip_opts',(iphlen-5),data[datai:datai+ip_optslen])
-			datai+=ip_optslen
+			#ip Option Format - http://www.tcpipguide.com/free/t_IPDatagramOptionsandOptionFormat.htm
+			#IP Option Numbers - https://www.iana.org/assignments/ip-parameters/ip-parameters.xhtml
+			firstopth = data[datai:datai+2]
+			datai+=datai+2		
+				
+			firstopt = struct.unpack('!BB' , firstopth)
+						
+			foptcop=firstopt[0]>>8-1
+			foptcla=(firstopt[0]>>8-1-2)&2**2-1
+			foptnum=firstopt[0]&2**5-1
+			ipoptclas = {0:'CTRL',2:'DB&M'}
+			#IP Router Alert Option - https://tools.ietf.org/html/rfc2113
+			ipoptnums = {20:'RTRALT'}
+			foplen=firstopt[1]
+			fopdata=data[datai:datai+(foplen-2)]
+			
+			#ip_optslen=(iphlen-5)*4
+			#print('ip_opts',(iphlen-5),data[datai:datai+ip_optslen])
+			
+			print(
+				'fcopy={}'.format(foptcop),
+				'clas={}({})'.format(ipoptclas.get(foptcla), foptcla),
+				'opn={}({})'.format(ipoptnums.get(foptnum), foptnum),
+				'oplen={}'.format(foplen),
+				'opdata={}'.format(bytes_bin_repr(fopdata)))
 
 		ttl = iph[5]
 		protocol = iph[6]
@@ -151,7 +190,10 @@ def handle_packet(pkh, data):
 			tcph_length = hl_res >> 4
 			res=hl_res&(2**7-1)
 			flags=tcph[5]
-			print(*[k+'='+str(tcph[i]) for i,k in enumerate(tcpstruct) if k not in ['srcport','dstport','hl_res','flags']], 'hlenw=' + str(tcph_length), 'res='+bin(res)[2:].zfill(6))
+			print(
+				*[k+'='+str(tcph[i]) for i,k in enumerate(tcpstruct) if k not in ['srcport','dstport','hl_res','flags']],
+				'hlenw=' + str(tcph_length),
+				'res='+int_bin_repr(res, 6))
 			#print(*[k+'='+str(tcph[i]) for i,k in enumerate(tcpstruct)], 'hlenw=' + str(tcph_length))
 			#print(*[str(i)+'='+str(flags&2**i) for i in range(6)])
 			tcpflag=['fin','syn','rst','psh','ack','urg']
@@ -200,7 +242,7 @@ def handle_packet(pkh, data):
 						ungzip = f.read()
 						print(ungzip)
 					except: 
-						print('invalid gzip')
+						printerr('invalid gzip')
 					finally:
 						f.close()
 				#print(data[datai:].hex())
@@ -252,7 +294,10 @@ def handle_packet(pkh, data):
 			# https://en.wikipedia.org/wiki/224.0.0.22
 			if str(d_addr) == '224.0.0.22':
 				igmp_header=data[datai:datai+4*4]
-				igmp_fields=struct.unpack('!BBH4sL4s',igmp_header)
+				try: igmp_fields=struct.unpack('!BBH4sL4s',igmp_header)
+				except struct.error as e:
+					printerr(e)
+					return
 				print('IGMPv3',plen, plen-datai, data[datai:datai+8], data[datai+8:datai+16])
 				print(hex(igmp_fields[0]),igmp_fields[1],'chk='+str(igmp_fields[2]),socket.inet_ntoa(igmp_fields[3]),socket.inet_ntoa(igmp_fields[5]))
 				#239.255.255.250 - https://en.wikipedia.org/wiki/Simple_Service_Discovery_Protocol
